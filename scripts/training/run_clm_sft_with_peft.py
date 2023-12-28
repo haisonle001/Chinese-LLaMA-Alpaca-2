@@ -240,11 +240,12 @@ class MyTrainingArguments(TrainingArguments):
     lora_alpha : Optional[float] = field(default=32.)
     modules_to_save : Optional[str] = field(default=None)
     peft_path : Optional[str] = field(default=None)
-    use_flash_attention_2 : Optional[bool] = field(default=False)
+    flash_attn : Optional[bool] = field(default=False)
     double_quant: Optional[bool] = field(default=True)
     quant_type: Optional[str] = field(default="nf4")
     load_in_kbits: Optional[int] = field(default=16)
     full_finetuning : Optional[bool] = field(default=False)
+
 
 
 logger = logging.getLogger(__name__)
@@ -259,6 +260,9 @@ def main():
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    if training_args.flash_attn:
+        from flash_attn_patch import replace_llama_attn_with_flash_attn
+        replace_llama_attn_with_flash_attn()
 
     send_example_telemetry("run_clm", model_args, data_args)
 
@@ -307,7 +311,7 @@ def main():
     config_kwargs = {
         "cache_dir": model_args.cache_dir,
         "revision": model_args.model_revision,
-        "use_auth_token": True if model_args.use_auth_token else None,
+        "token": True if model_args.use_auth_token else None,
     }
     if model_args.config_name:
         config = AutoConfig.from_pretrained(model_args.config_name, **config_kwargs)
@@ -325,7 +329,7 @@ def main():
         "cache_dir": model_args.cache_dir,
         "use_fast": model_args.use_fast_tokenizer,
         "revision": model_args.model_revision,
-        "use_auth_token": True if model_args.use_auth_token else None,
+        "token": True if model_args.use_auth_token else None,
     }
     if model_args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(model_args.tokenizer_name, **tokenizer_kwargs)
@@ -336,10 +340,12 @@ def main():
             "You are instantiating a new tokenizer from scratch. This is not supported by this script."
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
+    
+    tokenizer.pad_token = tokenizer.eos_token
 
-    if (len(tokenizer)) != 55296:
-        raise ValueError(f"The vocab size of the tokenizer should be 55296, but found {len(tokenizer)}.\n"
-                         "Please use Chinese-LLaMA-2 tokenizer.")
+    if (len(tokenizer)) != 45449:
+        raise ValueError(f"The vocab size of the tokenizer should be 45449, but found {len(tokenizer)}.\n"
+                         "Please use Vietnamese-LLaMA-2 tokenizer.")
 
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     eval_dataset=None
@@ -356,6 +362,7 @@ def main():
                 max_seq_length=data_args.max_seq_length,
                 data_cache_dir = None,
                 preprocessing_num_workers = data_args.preprocessing_num_workers)
+            # train_dataset = train_dataset.shuffle(seed=training_args.seed)
         logger.info(f"Num train_samples  {len(train_dataset)}")
         logger.info("Training example:")
         logger.info(tokenizer.decode(train_dataset[0]['input_ids']))
@@ -407,24 +414,37 @@ def main():
         config=config,
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
-        use_auth_token=True if model_args.use_auth_token else None,
+        token=True if model_args.use_auth_token else None,
         torch_dtype=torch_dtype,
-        low_cpu_mem_usage=True,
-        device_map=device_map,
+        # low_cpu_mem_usage=True,
+        # device_map=device_map,
         load_in_4bit=load_in_4bit,
         load_in_8bit=load_in_8bit,
         quantization_config=quantization_config,
-        use_flash_attention_2=training_args.use_flash_attention_2
     )
+
     if training_args.load_in_kbits in [4, 8]:
         model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=training_args.gradient_checkpointing)
+    ### gradient
+    else:
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+        else:
+            def make_inputs_require_grad(module, _input, output):
+                output.requires_grad_(True)
+
+            model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+        # enable gradient checkpointing for memory efficiency
+        model.gradient_checkpointing_enable()
     model.config.use_cache = False
+
     model_vocab_size = model.get_input_embeddings().weight.shape[0]
     logger.info(f"Model vocab size: {model_vocab_size}")
     logger.info(f"len(tokenizer):{len(tokenizer)}")
     if model_vocab_size != len(tokenizer):
         logger.info(f"Resize model vocab size to {len(tokenizer)}")
         model.resize_token_embeddings(len(tokenizer))
+
     if not training_args.full_finetuning:
         if training_args.peft_path is not None:
             logger.info("Peft from pre-trained model")
@@ -454,7 +474,6 @@ def main():
         model.state_dict = (
             lambda self, *_, **__: get_peft_model_state_dict(self, old_state_dict())
         ).__get__(model, type(model))
-
     if not training_args.full_finetuning and training_args.gradient_checkpointing and \
         (not model.modules_to_save or 'embed_tokens' not in model.modules_to_save):
         # enable requires_grad to avoid exception during backward pass when using gradient_checkpoint without tuning embed.
@@ -464,6 +483,22 @@ def main():
             def make_inputs_require_grad(_module, _input, _output):
                 _output.requires_grad_(True)
             model.base_model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+
+    for name, module in model.named_modules():
+        if isinstance(module, LoraLayer):
+            if training_args.bf16:
+                module = module.to(torch.bfloat16)
+            if training_args.fp16:
+                module = module.to(torch.float16)
+        if 'norm' in name:
+            module = module.to(torch.float16)
+        if 'lm_head' in name or 'embed_tokens' in name:
+            if hasattr(module, 'weight'):
+                if training_args.bf16 and module.weight.dtype == torch.float32:
+                    module = module.to(torch.bfloat16)
+                if training_args.fp16 and module.weight.dtype == torch.float32:
+                    module = module.to(torch.float16)
+
 
     # Initialize our Trainer
     trainer = Trainer(

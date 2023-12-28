@@ -1,10 +1,10 @@
 """
 Usage: 
 python merge_llama2_with_chinese_lora_low_mem.py \
-    --base_model path/to/llama2-hf-model \
-    --lora_model path/to/chinese-llama2-or-alpaca2-lora \
+    --base_model bkai-foundation-models/vietnamese-llama2-7b-120GB \
+    --lora_model /home/lhson/lhson/Chinese-LLaMA-Alpaca-2/scripts/training/output_dir/vinataba/checkpoint-250 \
     --output_type [huggingface|pth|] \
-    --output_dir path/to/output-dir
+    --output_dir /home/lhson/lhson/Chinese-LLaMA-Alpaca-2/scripts/training/checkpoints_merged
 """
 import argparse
 import json
@@ -12,7 +12,7 @@ import os
 import gc
 import torch
 import peft
-from transformers import LlamaTokenizer
+from transformers import LlamaTokenizer,AutoTokenizer
 from transformers.modeling_utils import dtype_byte_size
 from huggingface_hub import snapshot_download
 import re
@@ -252,7 +252,7 @@ if __name__=='__main__':
     if not os.path.exists(lora_model_path):
         print("Cannot find lora model on the disk. Downloading lora model from hub...")
         lora_model_path = snapshot_download(repo_id=lora_model_path)
-    tokenizer = LlamaTokenizer.from_pretrained(lora_model_path, legacy=True)
+    tokenizer = AutoTokenizer.from_pretrained("/home/lhson/lhson/Chinese-LLaMA-Alpaca-2/scripts/training/checkpoints/checkpoints_merged/merged_tokenizer_hf", legacy=True)
     lora_config = peft.LoraConfig.from_pretrained(lora_model_path)
     lora_state_dict = torch.load(os.path.join(lora_model_path,'adapter_model.bin'),map_location='cpu')
     if 'base_model.model.model.embed_tokens.weight' in lora_state_dict:

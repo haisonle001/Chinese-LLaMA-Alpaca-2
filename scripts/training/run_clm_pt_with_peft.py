@@ -32,7 +32,7 @@ from typing import Optional, List, Dict, Any, Mapping
 from pathlib import Path
 import datasets
 import torch
-from datasets import load_dataset, concatenate_datasets
+from datasets import load_dataset, concatenate_datasets, load_from_disk
 
 import transformers
 from transformers import (
@@ -338,7 +338,12 @@ class DataTrainingArguments:
     keep_linebreaks: bool = field(
         default=True, metadata={"help": "Whether to keep line breaks when using TXT files or not."}
     )
-    data_cache_dir: Optional[str] = field(default="./", metadata={"help": "The datasets processed stored"})
+    data_cache_dir: Optional[str] = field(default="./", 
+                                          metadata={"help": "The datasets processed stored"})
+
+    load_from_disk: bool = field(
+        default=False, metadata={"help": "Read from list of load_from_disks kind dataset rather txt."}
+    )
 
     def __post_init__(self):
         if self.streaming:
@@ -354,18 +359,20 @@ class MyTrainingArguments(TrainingArguments):
     modules_to_save : Optional[str] = field(default=None)
     debug_mode : Optional[bool] = field(default=False)
     peft_path : Optional[str] = field(default=None)
-    use_flash_attention_2 : Optional[bool] = field(default=False)
+    flash_attn : Optional[bool] = field(default=False)
     double_quant: Optional[bool] = field(default=True)
     quant_type: Optional[str] = field(default="nf4")
     load_in_kbits: Optional[int] = field(default=16)
+    cosine_min_lr_ratio: Optional[float] = field(default=0, 
+                                              metadata={"help": "Final Learning Rate for cosine scheduler"})
     full_finetuning : Optional[bool] = field(default=False)
-
 
 logger = logging.getLogger(__name__)
 
 
 def main():
 
+    # https://python.plainenglish.io/how-to-automatically-generate-command-line-interface-for-python-programs-e9fd9b6a99ca
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, MyTrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         # If we pass only one argument to the script and it's the path to a json file,
@@ -373,6 +380,10 @@ def main():
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    if training_args.flash_attn:
+        from flash_attn_patch import replace_llama_attn_with_flash_attn
+        replace_llama_attn_with_flash_attn()
 
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
@@ -398,7 +409,7 @@ def main():
     # Log on each process the small summary:
     logger.warning(
         f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
-        + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
+        + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16 or training_args.bf16}"
     )
 
     # Detecting last checkpoint.
@@ -422,7 +433,7 @@ def main():
     config_kwargs = {
         "cache_dir": model_args.cache_dir,
         "revision": model_args.model_revision,
-        "use_auth_token": True if model_args.use_auth_token else None,
+        "token": True if model_args.use_auth_token else None,
     }
     if model_args.config_name:
         config = AutoConfig.from_pretrained(model_args.config_name, **config_kwargs)
@@ -440,7 +451,7 @@ def main():
         "cache_dir": model_args.cache_dir,
         "use_fast": model_args.use_fast_tokenizer,
         "revision": model_args.model_revision,
-        "use_auth_token": True if model_args.use_auth_token else None,
+        "token": True if model_args.use_auth_token else None,
     }
     if model_args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(model_args.tokenizer_name, **tokenizer_kwargs)
@@ -504,12 +515,19 @@ def main():
     with training_args.main_process_first(desc="dataset map tokenization and grouping"):
         lm_datasets = []
         path = Path(data_args.dataset_dir)
-        files = [file.name for file in path.glob("*.txt")]
+
+        if data_args.load_from_disk:
+            files = os.listdir(path) # file nows is folder
+        else:
+            files = [file.name for file in path.glob("*.txt")]
         if training_args.debug_mode is True:
             files = [files[0]]
         for idx, file in enumerate(files):
             data_file = os.path.join(path, file)
-            filename = ''.join(file.split(".")[:-1])
+            if not data_args.load_from_disk:
+                filename = ''.join(file.split(".")[:-1])
+            else:
+                filename = file
             cache_path = os.path.join(data_args.data_cache_dir, filename+f"_{block_size}")
             os.makedirs(cache_path, exist_ok=True)
             try:
@@ -518,7 +536,15 @@ def main():
             except Exception:
                 cache_dir = os.path.join(data_args.data_cache_dir, filename+f"_text_{block_size}")
                 os.makedirs(cache_dir, exist_ok=True)
-                raw_dataset = load_dataset("text", data_files=data_file, cache_dir=cache_dir, keep_in_memory=False)
+                if data_args.load_from_disk:
+                    raw_dataset = datasets.DatasetDict({"train": load_from_disk(data_file)})
+                else:
+                    raw_dataset = load_dataset("text", 
+                                               data_files=data_file, 
+                                               cache_dir=cache_dir, 
+                                               keep_in_memory=False,
+                                               )
+
                 logger.info(f"{file} has been loaded")
                 tokenized_dataset = raw_dataset.map(
                     tokenize_function,
@@ -539,6 +565,7 @@ def main():
                     cache_file_names = {k: os.path.join(cache_dir, 'grouped.arrow') for k in tokenized_dataset},
                     desc=f"Grouping texts in chunks of {block_size}",
                 )
+                logger.info(f"\n\n---------Num raw train_samples  {len(tokenized_dataset)}---------\n\n")
                 processed_dataset = grouped_datasets
                 processed_dataset.save_to_disk(cache_path)
             if idx == 0:
@@ -553,7 +580,8 @@ def main():
         if data_args.max_train_samples is not None:
             max_train_samples = min(len(train_dataset), data_args.max_train_samples)
             train_dataset = train_dataset.select(range(max_train_samples))
-        logger.info(f"Num train_samples  {len(train_dataset)}")
+
+        logger.info(f"\n\n---------Num raw train_samples  {len(train_dataset)}---------\n\n")
         logger.info("Training example:")
         logger.info(tokenizer.decode(train_dataset[0]['input_ids']))
     if training_args.do_eval:
@@ -565,6 +593,7 @@ def main():
         logger.info("Evaluation example:")
         logger.info(tokenizer.decode(eval_dataset[0]['input_ids']))
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
+
     if training_args.load_in_kbits in [4, 8]:
         load_in_4bit = training_args.load_in_kbits == 4
         load_in_8bit = training_args.load_in_kbits == 8
@@ -600,14 +629,13 @@ def main():
             config=config,
             cache_dir=model_args.cache_dir,
             revision=model_args.model_revision,
-            use_auth_token=True if model_args.use_auth_token else None,
+            token=True if model_args.use_auth_token else None,
             torch_dtype=torch_dtype,
             low_cpu_mem_usage=True,
             device_map=device_map,
             load_in_4bit=load_in_4bit,
             load_in_8bit=load_in_8bit,
             quantization_config=quantization_config,
-            use_flash_attention_2=training_args.use_flash_attention_2
         )
     else:
         model = AutoModelForCausalLM.from_config(config)
@@ -620,11 +648,34 @@ def main():
     tokenizer_vocab_size = len(tokenizer)
     logger.info(f"Model vocab size: {model_vocab_size}")
     logger.info(f"Tokenizer vocab size: {tokenizer_vocab_size}")
-    if tokenizer_vocab_size != 55296:
-        raise ValueError(f"The vocab size of tokenizer is {tokenizer_vocab_size}, not 55296. Please use Chinese-LLaMA-2 tokenizer.")
+    if tokenizer_vocab_size != 45449:
+        raise ValueError(f"The vocab size of tokenizer is {tokenizer_vocab_size}, not 45449. Please use Vietnamese-LLaMA-2 tokenizer.")
     if model_vocab_size != tokenizer_vocab_size:
         logger.info(f"Resize model vocab size to {tokenizer_vocab_size}")
         model.resize_token_embeddings(len(tokenizer))
+
+    # if training_args.peft_path is not None:
+    #     logger.info("Peft from pre-trained model")
+    #     model = PeftModel.from_pretrained(model, training_args.peft_path, device_map=device_map)
+    # else:
+    #     logger.info("Init new peft model")
+    #     target_modules = training_args.trainable.split(',')
+    #     modules_to_save = training_args.modules_to_save
+    #     if modules_to_save is not None:
+    #         modules_to_save = modules_to_save.split(',')
+    #     lora_rank = training_args.lora_rank
+    #     lora_dropout = training_args.lora_dropout
+    #     lora_alpha = training_args.lora_alpha
+    #     logger.info(f"target_modules: {target_modules}")
+    #     logger.info(f"lora_rank: {lora_rank}")
+    #     peft_config = LoraConfig(
+    #         task_type=TaskType.CAUSAL_LM,
+    #         target_modules=target_modules,
+    #         inference_mode=False,
+    #         r=lora_rank, lora_alpha=lora_alpha,
+    #         lora_dropout=lora_dropout,
+    #         modules_to_save=modules_to_save)
+    #     model = get_peft_model(model, peft_config)
     if not training_args.full_finetuning:
         if training_args.peft_path is not None:
             logger.info("Peft from pre-trained model")
@@ -663,6 +714,22 @@ def main():
             def make_inputs_require_grad(_module, _input, _output):
                 _output.requires_grad_(True)
             model.base_model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+
+    for name, module in model.named_modules():
+        if isinstance(module, LoraLayer):
+            if training_args.bf16:
+                module = module.to(torch.bfloat16)
+            if training_args.fp16:
+                module = module.to(torch.float16)
+        if 'norm' in name:
+            module = module.to(torch.float16)
+        if 'lm_head' in name or 'embed_tokens' in name:
+            if hasattr(module, 'weight'):
+                if training_args.bf16 and module.weight.dtype == torch.float32:
+                    module = module.to(torch.bfloat16)
+                if training_args.fp16 and module.weight.dtype == torch.float32:
+                    module = module.to(torch.float16)
+
 
     # Initialize our Trainer
     trainer = Trainer(
