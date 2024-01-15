@@ -362,7 +362,7 @@ def main():
                 max_seq_length=data_args.max_seq_length,
                 data_cache_dir = None,
                 preprocessing_num_workers = data_args.preprocessing_num_workers)
-            # train_dataset = train_dataset.shuffle(seed=training_args.seed)
+            train_dataset = train_dataset.shuffle(seed=training_args.seed)
         logger.info(f"Num train_samples  {len(train_dataset)}")
         logger.info("Training example:")
         logger.info(tokenizer.decode(train_dataset[0]['input_ids']))

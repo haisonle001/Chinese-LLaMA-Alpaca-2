@@ -472,6 +472,10 @@ def main():
             try:
                 processed_dataset = datasets.load_from_disk(cache_path, keep_in_memory=False)
                 logger.info(f'training datasets-{filename} has been loaded from disk')
+                for column in processed_dataset['train'].column_names:
+                    if column in columns_to_remove: 
+                        processed_dataset = processed_dataset.remove_columns(column)
+                print(processed_dataset)
             except Exception:
                 cache_dir = os.path.join(data_args.data_cache_dir, filename+f"_text_{block_size}")
                 os.makedirs(cache_dir, exist_ok=True)
@@ -485,6 +489,8 @@ def main():
                                                )
 
                 logger.info(f"{file} has been loaded")
+                print(raw_dataset)
+                # raw_dataset = raw_dataset.shuffle(seed=training_args.seed)
                 tokenized_dataset = raw_dataset.map(
                     tokenize_function,
                     batched=True,
@@ -495,6 +501,13 @@ def main():
                     cache_file_names = {k: os.path.join(cache_dir, 'tokenized.arrow') for k in raw_dataset},
                     desc="Running tokenizer on dataset",
                 )
+                # Remove unused columns after tokenization
+                columns_to_remove = ["url","language","type","jurisdiction"]
+                print("Columns in the tokenized dataset:", tokenized_dataset['train'].column_names)
+                for column in tokenized_dataset['train'].column_names:
+                    if column in columns_to_remove: 
+                        tokenized_dataset = tokenized_dataset.remove_columns(column)
+                print(tokenized_dataset)
                 grouped_datasets = tokenized_dataset.map(
                     group_texts,
                     batched=True,
